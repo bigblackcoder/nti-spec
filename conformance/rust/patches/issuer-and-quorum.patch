@@ -1,0 +1,590 @@
+diff --git a/ube-foundation/SECURITY_PATCH.md b/ube-foundation/SECURITY_PATCH.md
+new file mode 100644
+index 0000000..9596251
+--- /dev/null
++++ b/ube-foundation/SECURITY_PATCH.md
+@@ -0,0 +1,25 @@
++# Candidate core fix for issue #20
++
++Apply `issuer-and-quorum.patch` to Neutral-Trust-Infrastructure commit
++`308fd1c95f2c2f975e8b6b6c5e7ccba0e4d7b203` with `git apply --check` then `git apply`.
++The two original regression assertions are preserved unchanged in the patch.
++
++Capability tokens now require a trusted local issuer key, a valid strict Ed25519
++signature, and a local grant authorizing that issuer for the token capability.
++Configure `register_issuer_key(issuer, public_key_bytes)` and `grant(issuer, capability)`
++through the administrative API. A request's own public key cannot establish issuer
++trust. Existing persisted states default to no trusted issuers until configured.
++Unsigned tokens are intentionally no longer accepted. Local explicit grants remain
++available. The Python wrapper exposes the same issuer-key registration method.
++
++Quorum shortfalls now return an error before module dispatch. Module errors and
++result disagreement return errors without falling back to another execution.
++This fixes local module threshold enforcement; it does not establish Byzantine
++validator independence or implement consensus-before-effect. Selected modules still
++execute before their results can be compared. No runtime halt or rollback claim
++is made by this patch.
++
++CI keeps the pinned failing baseline and separately applies and tests this patch,
++including existing core tests, positive controls, issuer authentication, tampering,
++persistence, eligible-module counts, and error/disagreement paths. Build evidence
++is retained by GitHub Actions. The patch is a candidate until CI has completed.
+diff --git a/ube-foundation/src/lib.rs b/ube-foundation/src/lib.rs
+index 54271f0..ebe4faa 100644
+--- a/ube-foundation/src/lib.rs
++++ b/ube-foundation/src/lib.rs
+@@ -92,7 +92,7 @@ impl CapabilityToken {
+             return false;
+         };
+         public_key
+-            .verify(&self.message_to_sign(), &signature)
++            .verify_strict(&self.message_to_sign(), &signature)
+             .is_ok()
+     }
+ }
+@@ -343,6 +343,9 @@ pub struct TrustEngineState {
+     pub capabilities: BTreeMap<String, BTreeSet<String>>,
+     /// Registered expected code identity hashes per agent.
+     pub expected_code_hashes: BTreeMap<String, String>,
++    /// Trusted capability issuer keys, configured locally rather than supplied by requests.
++    #[serde(default)]
++    pub issuer_keys: BTreeMap<String, Vec<u8>>,
+     /// Registered validator voter Ed25519 public keys.
+     pub voter_keys: BTreeMap<String, Vec<u8>>,
+     /// Revocation list of invalidated capability token IDs.
+@@ -362,6 +365,8 @@ pub struct TrustEngine {
+     pub capabilities: BTreeMap<String, BTreeSet<String>>,
+     /// Expected agent code source hashes.
+     pub expected_code_hashes: BTreeMap<String, String>,
++    /// Trusted capability issuer keys. Issuers also need a local capability grant.
++    pub issuer_keys: BTreeMap<String, Vec<u8>>,
+     /// Registered validator public keys.
+     pub voter_keys: BTreeMap<String, Vec<u8>>,
+     /// Token revocation set.
+@@ -456,6 +461,7 @@ impl TrustEngine {
+         Self {
+             capabilities: BTreeMap::new(),
+             expected_code_hashes: BTreeMap::new(),
++            issuer_keys: BTreeMap::new(),
+             voter_keys: BTreeMap::new(),
+             revocation_list: BTreeSet::new(),
+             events: Vec::new(),
+@@ -476,6 +482,7 @@ impl TrustEngine {
+         TrustEngineState {
+             capabilities: self.capabilities.clone(),
+             expected_code_hashes: self.expected_code_hashes.clone(),
++            issuer_keys: self.issuer_keys.clone(),
+             voter_keys: self.voter_keys.clone(),
+             revocation_list: self.revocation_list.clone(),
+             events: self.events.clone(),
+@@ -500,6 +507,7 @@ impl TrustEngine {
+         let engine = Self {
+             capabilities: state.capabilities,
+             expected_code_hashes: state.expected_code_hashes,
++            issuer_keys: state.issuer_keys,
+             voter_keys: state.voter_keys,
+             revocation_list: state.revocation_list,
+             events: state.events,
+@@ -532,6 +540,26 @@ impl TrustEngine {
+             .insert(agent_id.into(), hash.into());
+     }
+ 
++    /// Configures an issuer key through the trusted administrative API.
++    /// This does not grant authority: grant the issuer each capability it may issue.
++    pub fn register_issuer_key(
++        &mut self,
++        issuer: impl Into<String>,
++        public_key_bytes: Vec<u8>,
++    ) -> Result<(), String> {
++        let bytes: &[u8; 32] = public_key_bytes
++            .as_slice()
++            .try_into()
++            .map_err(|_| "Issuer key must contain 32 bytes".to_string())?;
++        let key =
++            VerifyingKey::from_bytes(bytes).map_err(|_| "Invalid issuer public key".to_string())?;
++        if key.is_weak() {
++            return Err("Weak issuer public key".into());
++        }
++        self.issuer_keys.insert(issuer.into(), public_key_bytes);
++        Ok(())
++    }
++
+     /// Explicitly grants a capability permission to an actor.
+     pub fn grant(&mut self, actor: impl Into<String>, capability: impl Into<String>) {
+         self.capabilities
+@@ -682,6 +710,28 @@ impl TrustEngine {
+         }
+ 
+         if let Some(token) = &request.token {
++            let Some(issuer_key) = self.issuer_keys.get(&token.root_actor) else {
++                return PolicyDecision {
++                    decision: Decision::Deny,
++                    reason: "untrusted token issuer".into(),
++                };
++            };
++            if !token.verify(issuer_key) {
++                return PolicyDecision {
++                    decision: Decision::Deny,
++                    reason: "invalid token signature".into(),
++                };
++            }
++            if !self
++                .capabilities
++                .get(&token.root_actor)
++                .is_some_and(|caps| caps.contains(&token.capability))
++            {
++                return PolicyDecision {
++                    decision: Decision::Deny,
++                    reason: "issuer lacks capability".into(),
++                };
++            }
+             if self.revocation_list.contains(&token.id) {
+                 return PolicyDecision {
+                     decision: Decision::Deny,
+@@ -1291,49 +1341,43 @@ impl Orchestrator {
+             return Err(format!("Denied: {}", decision.reason));
+         }
+ 
+-        // If local consensus is required, use local modules
+-        if self.consensus_threshold > 1 && self.modules.len() >= self.consensus_threshold {
++        // A required threshold is mandatory; never fall back to single dispatch.
++        if self.consensus_threshold > 1 {
+             use futures::future::join_all;
+             let matching_modules: Vec<&Box<dyn Module>> = self
+                 .modules
+                 .values()
+                 .filter(|m| m.capabilities().contains(&request.capability))
+                 .collect();
+-
+-            if matching_modules.len() >= self.consensus_threshold {
+-                let mut futures = Vec::new();
+-                for module in matching_modules.iter().take(self.consensus_threshold) {
+-                    futures.push(module.execute(&request.action, request.input.clone()));
+-                }
+-
+-                let results = join_all(futures).await;
+-                let mut valid_results = Vec::new();
+-                for val in results.into_iter().flatten() {
+-                    valid_results.push(val);
+-                }
+-
+-                if valid_results.len() >= self.consensus_threshold {
+-                    let Ok(first_bytes) = serde_json::to_vec(&valid_results[0]) else {
+-                        return Err("Consensus failed: serialization error".into());
+-                    };
+-                    let first_hash = hex::encode(Sha256::digest(first_bytes));
+-                    for res in &valid_results[1..] {
+-                        let Ok(current_bytes) = serde_json::to_vec(res) else {
+-                            return Err("Consensus failed: serialization error".into());
+-                        };
+-                        let current_hash = hex::encode(Sha256::digest(current_bytes));
+-                        if !bool::from(current_hash.as_bytes().ct_eq(first_hash.as_bytes())) {
+-                            return Err(
+-                                "Consensus failed: modules returned diverging results".into()
+-                            );
+-                        }
+-                    }
+-                    return Ok(valid_results[0].clone());
++            if matching_modules.len() < self.consensus_threshold {
++                return Err("Consensus failed: insufficient eligible modules".into());
++            }
++            let results = join_all(
++                matching_modules
++                    .iter()
++                    .take(self.consensus_threshold)
++                    .map(|module| module.execute(&request.action, request.input.clone())),
++            )
++            .await;
++            let valid_results: Vec<serde_json::Value> = results
++                .into_iter()
++                .collect::<Result<_, _>>()
++                .map_err(|e| format!("Consensus failed: module error: {}", e))?;
++            let first_bytes = serde_json::to_vec(&valid_results[0])
++                .map_err(|_| "Consensus failed: serialization error".to_string())?;
++            let first_hash = Sha256::digest(first_bytes);
++            for result in &valid_results[1..] {
++                let bytes = serde_json::to_vec(result)
++                    .map_err(|_| "Consensus failed: serialization error".to_string())?;
++                let hash = Sha256::digest(bytes);
++                if !bool::from(hash.as_slice().ct_eq(first_hash.as_slice())) {
++                    return Err("Consensus failed: modules returned diverging results".into());
+                 }
+             }
++            return Ok(valid_results[0].clone());
+         }
+ 
+-        // Default to first matching module if no threshold/local consensus failed
++        // Single-module execution is permitted only when no higher threshold is required.
+         let module = self
+             .modules
+             .values()
+diff --git a/ube-foundation/src/python_bindings.rs b/ube-foundation/src/python_bindings.rs
+index 17a3fc3..349f6bc 100644
+--- a/ube-foundation/src/python_bindings.rs
++++ b/ube-foundation/src/python_bindings.rs
+@@ -27,6 +27,16 @@ impl PyTrustEngine {
+         self.inner.grant(&actor, &capability);
+     }
+ 
++    pub fn register_issuer_key(
++        &mut self,
++        issuer: String,
++        public_key_bytes: Vec<u8>,
++    ) -> PyResult<()> {
++        self.inner
++            .register_issuer_key(issuer, public_key_bytes)
++            .map_err(pyo3::exceptions::PyValueError::new_err)
++    }
++
+     pub fn revoke_token(&mut self, token_id: String) {
+         self.inner.revoke_token(&token_id);
+     }
+diff --git a/ube-foundation/tests/core_tests.rs b/ube-foundation/tests/core_tests.rs
+index 0642646..82ca1b0 100644
+--- a/ube-foundation/tests/core_tests.rs
++++ b/ube-foundation/tests/core_tests.rs
+@@ -1,15 +1,21 @@
+ #[cfg(test)]
+ mod tests {
+     use chrono::{Duration, Utc};
++    use ed25519_dalek::{Signer, SigningKey};
+     use ube_foundation::*;
+ 
+     #[tokio::test]
+     async fn test_capability_token_expiry() {
+-        let engine = TrustEngine::default();
++        let mut engine = TrustEngine::default();
++        let issuer = SigningKey::from_bytes(&[42; 32]);
++        engine
++            .register_issuer_key("alice", issuer.verifying_key().to_bytes().to_vec())
++            .unwrap();
++        engine.grant("alice", "test");
+         let future_date = (Utc::now() + Duration::days(1)).to_rfc3339();
+         let past_date = (Utc::now() - Duration::days(1)).to_rfc3339();
+ 
+-        let valid_token = CapabilityToken {
++        let mut valid_token = CapabilityToken {
+             id: "valid".into(),
+             root_actor: "alice".into(),
+             capability: "test".into(),
+@@ -20,7 +26,7 @@ mod tests {
+             signature: vec![],
+         };
+ 
+-        let expired_token = CapabilityToken {
++        let mut expired_token = CapabilityToken {
+             id: "expired".into(),
+             root_actor: "alice".into(),
+             capability: "test".into(),
+@@ -31,6 +37,14 @@ mod tests {
+             signature: vec![],
+         };
+ 
++        valid_token.signature = issuer
++            .sign(&valid_token.message_to_sign())
++            .to_bytes()
++            .to_vec();
++        expired_token.signature = issuer
++            .sign(&expired_token.message_to_sign())
++            .to_bytes()
++            .to_vec();
+         let req_valid = ActionRequest {
+             id: "1".into(),
+             actor: "bob".into(),
+@@ -66,8 +80,13 @@ mod tests {
+     #[test]
+     fn test_token_revocation() {
+         let mut engine = TrustEngine::default();
++        let issuer = SigningKey::from_bytes(&[42; 32]);
++        engine
++            .register_issuer_key("alice", issuer.verifying_key().to_bytes().to_vec())
++            .unwrap();
++        engine.grant("alice", "test");
+         let token_id = "token-123";
+-        let token = CapabilityToken {
++        let mut token = CapabilityToken {
+             id: token_id.into(),
+             root_actor: "alice".into(),
+             capability: "test".into(),
+@@ -75,6 +94,7 @@ mod tests {
+             signature: vec![],
+         };
+ 
++        token.signature = issuer.sign(&token.message_to_sign()).to_bytes().to_vec();
+         let req = ActionRequest {
+             id: "1".into(),
+             actor: "bob".into(),
+diff --git a/ube-foundation/tests/nti_conformance_regressions.rs b/ube-foundation/tests/nti_conformance_regressions.rs
+new file mode 100644
+index 0000000..e0f4b13
+--- /dev/null
++++ b/ube-foundation/tests/nti_conformance_regressions.rs
+@@ -0,0 +1,79 @@
++//! Issue #20: candidate enforcement regressions against the pinned Rust engine.
++use ed25519_dalek::{Signer, SigningKey};
++use std::sync::{atomic::{AtomicUsize, Ordering}, Arc};
++use ube_foundation::*;
++
++fn request(token: Option<CapabilityToken>) -> ActionRequest {
++    let key = SigningKey::from_bytes(&[7; 32]); // Public fixture material only.
++    let mut request = ActionRequest {
++        id: "nti-rust-regression".into(),
++        actor: "recipient".into(),
++        capability: "transfer".into(),
++        action: "transfer".into(),
++        input: serde_json::json!({"amount": 1}),
++        signature: None,
++        pqc_signature: None,
++        public_key: Some(key.verifying_key().to_bytes().to_vec()),
++        pqc_public_key: None,
++        token,
++        identity_claim: None,
++    };
++    request.signature = Some(key.sign(&request.message_to_sign()).to_bytes().to_vec());
++    request
++}
++
++#[test]
++fn unsigned_capability_cannot_grant_authority() {
++    let engine = TrustEngine::default();
++    // A valid request signature does not substitute for an issuer-signed grant.
++    assert_eq!(engine.evaluate(&request(None)).decision, Decision::Deny);
++    let unsigned = CapabilityToken {
++        id: "unsigned-fixture".into(),
++        root_actor: "issuer".into(),
++        capability: "transfer".into(),
++        caveats: vec![],
++        signature: vec![],
++    };
++    assert_eq!(engine.evaluate(&request(Some(unsigned))).decision, Decision::Deny,
++        "an unsigned capability must not create authority for this recipient");
++    // Positive control for the engine's explicit local grant path.
++    let mut granted = TrustEngine::default();
++    granted.grant("recipient", "transfer");
++    assert_eq!(granted.evaluate(&request(None)).decision, Decision::Allow);
++}
++
++struct EffectModule(Arc<AtomicUsize>);
++#[async_trait::async_trait]
++impl Module for EffectModule {
++    fn name(&self) -> &str { "effect-fixture" }
++    fn capabilities(&self) -> Vec<String> { vec!["transfer".into()] }
++    async fn execute(&self, _: &str, _: serde_json::Value) -> Result<serde_json::Value, String> {
++        self.0.fetch_add(1, Ordering::SeqCst);
++        Ok(serde_json::json!({"executed": true}))
++    }
++}
++
++fn orchestrator(threshold: usize, effects: Arc<AtomicUsize>) -> Orchestrator {
++    let mut engine = TrustEngine::default();
++    engine.grant("recipient", "transfer");
++    let mut orchestrator = Orchestrator::new(engine);
++    orchestrator.set_consensus_threshold(threshold);
++    orchestrator.register_module(Box::new(EffectModule(effects)));
++    orchestrator
++}
++
++#[tokio::test]
++async fn required_quorum_blocks_dispatch_when_one_module_is_available() {
++    // Positive control: the same authorized operation executes at threshold one.
++    let allowed_effects = Arc::new(AtomicUsize::new(0));
++    let mut allowed = orchestrator(1, allowed_effects.clone());
++    assert!(allowed.run_task(request(None)).await.is_ok());
++    assert_eq!(allowed_effects.load(Ordering::SeqCst), 1);
++
++    let blocked_effects = Arc::new(AtomicUsize::new(0));
++    let mut blocked = orchestrator(2, blocked_effects.clone());
++    let result = blocked.run_task(request(None)).await;
++    assert_eq!(blocked_effects.load(Ordering::SeqCst), 0,
++        "a required quorum of two must block dispatch with only one eligible module");
++    assert!(result.is_err(), "quorum shortfall must return refusal: {result:?}");
++}
+diff --git a/ube-foundation/tests/security_patch_tests.rs b/ube-foundation/tests/security_patch_tests.rs
+new file mode 100644
+index 0000000..9da8fdf
+--- /dev/null
++++ b/ube-foundation/tests/security_patch_tests.rs
+@@ -0,0 +1,183 @@
++use ed25519_dalek::{Signer, SigningKey};
++use std::sync::{
++    atomic::{AtomicUsize, Ordering},
++    Arc,
++};
++use ube_foundation::*;
++
++fn token() -> CapabilityToken {
++    let issuer = SigningKey::from_bytes(&[42; 32]);
++    let mut token = CapabilityToken {
++        id: "signed-fixture".into(),
++        root_actor: "issuer".into(),
++        capability: "transfer".into(),
++        caveats: vec![],
++        signature: vec![],
++    };
++    token.signature = issuer.sign(&token.message_to_sign()).to_bytes().to_vec();
++    token
++}
++fn engine() -> TrustEngine {
++    let mut engine = TrustEngine::new();
++    let issuer = SigningKey::from_bytes(&[42; 32]);
++    engine
++        .register_issuer_key("issuer", issuer.verifying_key().to_bytes().to_vec())
++        .unwrap();
++    engine.grant("issuer", "transfer");
++    engine
++}
++fn request(token: Option<CapabilityToken>) -> ActionRequest {
++    ActionRequest {
++        id: "patch-control".into(),
++        actor: "recipient".into(),
++        capability: "transfer".into(),
++        action: "transfer".into(),
++        input: serde_json::json!({"amount": 1}),
++        signature: None,
++        public_key: None,
++        pqc_signature: None,
++        pqc_public_key: None,
++        identity_claim: None,
++        token,
++    }
++}
++#[test]
++fn trusted_signed_token_is_accepted_but_tampering_is_denied() {
++    let engine = engine();
++    assert_eq!(
++        engine.evaluate(&request(Some(token()))).decision,
++        Decision::Allow
++    );
++    for field in ["id", "issuer", "capability", "caveats", "signature"] {
++        let mut modified = token();
++        match field {
++            "id" => modified.id.push('x'),
++            "issuer" => modified.root_actor.push('x'),
++            "capability" => modified.capability.push('x'),
++            "caveats" => modified.caveats.push(Caveat {
++                location: None,
++                condition: CaveatType::Expires("2099-01-01T00:00:00Z".into()),
++            }),
++            _ => modified.signature.clear(),
++        }
++        assert_eq!(
++            engine.evaluate(&request(Some(modified))).decision,
++            Decision::Deny,
++            "{field}"
++        );
++    }
++}
++#[test]
++fn issuer_key_and_scope_must_both_be_trusted_locally() {
++    let mut configured = engine();
++    let outsider = SigningKey::from_bytes(&[7; 32]);
++    let mut forged = token();
++    forged.signature = outsider.sign(&forged.message_to_sign()).to_bytes().to_vec();
++    let mut forged_request = request(Some(forged));
++    forged_request.public_key = Some(outsider.verifying_key().to_bytes().to_vec());
++    forged_request.signature = Some(
++        outsider
++            .sign(&forged_request.message_to_sign())
++            .to_bytes()
++            .to_vec(),
++    );
++    assert_eq!(
++        configured.evaluate(&forged_request).decision,
++        Decision::Deny
++    );
++    configured.capabilities.clear();
++    assert_eq!(
++        configured.evaluate(&request(Some(token()))).decision,
++        Decision::Deny
++    );
++    configured.grant("issuer", "transfer");
++    configured.issuer_keys.clear();
++    assert_eq!(
++        configured.evaluate(&request(Some(token()))).decision,
++        Decision::Deny
++    );
++    assert!(configured.register_issuer_key("bad", vec![0; 31]).is_err());
++    assert!(configured.register_issuer_key("weak", vec![0; 32]).is_err());
++}
++#[test]
++fn issuer_trust_survives_persistence_and_legacy_state_defaults_to_no_issuers() {
++    let path = std::env::temp_dir().join(format!("nti-issuer-{}.json", rand::random::<u64>()));
++    engine().save_to_file(&path).unwrap();
++    let loaded = TrustEngine::load_from_file(&path).unwrap();
++    assert_eq!(
++        loaded.evaluate(&request(Some(token()))).decision,
++        Decision::Allow
++    );
++    let mut legacy = serde_json::to_value(loaded.export_state()).unwrap();
++    legacy.as_object_mut().unwrap().remove("issuer_keys");
++    std::fs::write(&path, serde_json::to_vec(&legacy).unwrap()).unwrap();
++    let loaded = TrustEngine::load_from_file(&path).unwrap();
++    std::fs::remove_file(path).unwrap();
++    assert_eq!(
++        loaded.evaluate(&request(Some(token()))).decision,
++        Decision::Deny
++    );
++}
++struct TestModule {
++    name: &'static str,
++    capability: &'static str,
++    calls: Arc<AtomicUsize>,
++    outcome: Result<serde_json::Value, String>,
++}
++#[async_trait::async_trait]
++impl Module for TestModule {
++    fn name(&self) -> &str {
++        self.name
++    }
++    fn capabilities(&self) -> Vec<String> {
++        vec![self.capability.into()]
++    }
++    async fn execute(&self, _: &str, _: serde_json::Value) -> Result<serde_json::Value, String> {
++        self.calls.fetch_add(1, Ordering::SeqCst);
++        self.outcome.clone()
++    }
++}
++#[tokio::test]
++async fn quorum_counts_eligible_modules_before_dispatch() {
++    let calls = Arc::new(AtomicUsize::new(0));
++    let mut o = Orchestrator::new(engine());
++    o.engine.grant("recipient", "transfer");
++    o.set_consensus_threshold(2);
++    for (name, cap) in [("a", "transfer"), ("b", "unrelated")] {
++        o.register_module(Box::new(TestModule {
++            name,
++            capability: cap,
++            calls: calls.clone(),
++            outcome: Ok(serde_json::json!(1)),
++        }));
++    }
++    assert!(o.run_task(request(None)).await.is_err());
++    assert_eq!(calls.load(Ordering::SeqCst), 0);
++}
++#[tokio::test]
++async fn quorum_success_errors_and_disagreement_never_fall_back() {
++    for (second, expected_success) in [
++        (Ok(serde_json::json!(1)), true),
++        (Err("fixture failure".into()), false),
++        (Ok(serde_json::json!(2)), false),
++    ] {
++        let calls = Arc::new(AtomicUsize::new(0));
++        let mut o = Orchestrator::new(engine());
++        o.engine.grant("recipient", "transfer");
++        o.set_consensus_threshold(2);
++        for (name, outcome) in [("a", Ok(serde_json::json!(1))), ("b", second)] {
++            o.register_module(Box::new(TestModule {
++                name,
++                capability: "transfer",
++                calls: calls.clone(),
++                outcome,
++            }));
++        }
++        assert_eq!(o.run_task(request(None)).await.is_ok(), expected_success);
++        assert_eq!(
++            calls.load(Ordering::SeqCst),
++            2,
++            "no fallback or duplicate dispatch"
++        );
++    }
++}
