@@ -1,0 +1,210 @@
+{
+  "profile": "nti-principal-binding-draft-01",
+  "status": "proposed-fixtures-not-executed",
+  "description": "Conformance matrix: decisions and no-dispatch expectations only. Runtime assertions require actual signed fixtures, trusted issuer configuration, resolver and protected resource.",
+  "decision_semantics": {
+    "ALLOW": "Verified identity, trusted principal binding and current action-specific authority; protected-resource execution may proceed",
+    "DENY": "Known invalid/absent authority; no dispatch",
+    "PAUSE": "Required authority status cannot be determined; incomplete_check; no dispatch"
+  },
+  "cases": [
+    {
+      "id": "PB-001",
+      "name": "valid binding and narrow delegation",
+      "positive": true,
+      "condition": "Trusted issuer signed principal binding; expected agent DID proof; delegation valid for operation and audience; fresh status",
+      "expected": "ALLOW",
+      "dispatch_count": 1
+    },
+    {
+      "id": "PB-002",
+      "name": "untrusted issuer",
+      "control": "PB-001",
+      "condition": "Identical fixture except issuer is not pretrusted for legal-identity claim",
+      "expected": "DENY",
+      "dispatch_count": 0
+    },
+    {
+      "id": "PB-003",
+      "name": "self-asserted legal identity",
+      "control": "PB-001",
+      "condition": "Binding issuer is agent itself without independently accepted legal identity proof",
+      "expected": "DENY",
+      "dispatch_count": 0
+    },
+    {
+      "id": "PB-004",
+      "name": "revoked principal binding",
+      "control": "PB-001",
+      "condition": "Authentic status confirms binding revoked",
+      "expected": "DENY",
+      "dispatch_count": 0
+    },
+    {
+      "id": "PB-005",
+      "name": "expired binding",
+      "control": "PB-001",
+      "condition": "Binding validity ended before action",
+      "expected": "DENY",
+      "dispatch_count": 0
+    },
+    {
+      "id": "PB-006",
+      "name": "wrong agent DID",
+      "control": "PB-001",
+      "condition": "Valid principal binding refers to different agent DID than signing actor",
+      "expected": "DENY",
+      "dispatch_count": 0
+    },
+    {
+      "id": "PB-007",
+      "name": "binding without delegation",
+      "control": "PB-001",
+      "condition": "Valid binding but no signed grant for requested action",
+      "expected": "DENY",
+      "dispatch_count": 0
+    },
+    {
+      "id": "PB-008",
+      "name": "wrong audience or action",
+      "control": "PB-001",
+      "condition": "Signed delegation permits a different resource or operation",
+      "expected": "DENY",
+      "dispatch_count": 0
+    },
+    {
+      "id": "PB-009",
+      "name": "revoked delegation",
+      "control": "PB-001",
+      "condition": "Live authoritative status confirms delegated grant revoked",
+      "expected": "DENY",
+      "dispatch_count": 0
+    },
+    {
+      "id": "PB-010",
+      "name": "unreachable authoritative status",
+      "control": "PB-001",
+      "condition": "Cannot establish required current status due to registry outage",
+      "expected": "PAUSE",
+      "reason": "tryLater",
+      "dispatch_count": 0
+    },
+    {
+      "id": "PB-011",
+      "name": "non-authoritative status source",
+      "control": "PB-001",
+      "condition": "Status response from registry not authorized for the binding/grant",
+      "expected": "PAUSE",
+      "reason": "not_authoritative",
+      "dispatch_count": 0
+    },
+    {
+      "id": "PB-012",
+      "name": "agent DID proof replay",
+      "control": "PB-001",
+      "condition": "Previously valid DID challenge response replayed with new request ID/nonce",
+      "expected": "DENY",
+      "dispatch_count": 0
+    },
+    {
+      "id": "PB-013",
+      "name": "old principal after transfer",
+      "control": "PB-001",
+      "condition": "Principal ownership reassigned; legacy principal delegation used after verified transfer/revocation",
+      "expected": "DENY",
+      "dispatch_count": 0
+    },
+    {
+      "id": "PB-014",
+      "name": "authorized key rotation",
+      "positive": true,
+      "condition": "Verifier accepts DID method authorized key rotation; fresh challenge and revalidated binding semantics",
+      "expected": "ALLOW",
+      "dispatch_count": 1
+    },
+    {
+      "id": "PB-015",
+      "name": "unproven key substitution",
+      "control": "PB-014",
+      "condition": "Attacker replaces agent key without authorized rotation",
+      "expected": "DENY",
+      "dispatch_count": 0
+    },
+    {
+      "id": "PB-016",
+      "name": "unsupported assurance",
+      "control": "PB-001",
+      "condition": "Trusted issuer but credential assurance level below required legal-identity claim policy",
+      "expected": "DENY",
+      "dispatch_count": 0
+    },
+    {
+      "id": "ANP-A1",
+      "name": "verified mutual ANP DID exchange plus accepted principal binding and delegation",
+      "interface": "ANP -> independent principal binding verifier -> NTI/ATP-compatible policy -> protected resource",
+      "condition": "verified mutual ANP DID exchange plus accepted principal binding and delegation",
+      "expected": "ALLOW",
+      "dispatch_count": 1
+    },
+    {
+      "id": "ANP-A2",
+      "name": "valid ANP DID authentication without accepted legal principal binding",
+      "interface": "ANP -> independent principal binding verifier -> NTI/ATP-compatible policy -> protected resource",
+      "condition": "valid ANP DID authentication without accepted legal principal binding",
+      "expected": "DENY",
+      "dispatch_count": 0
+    },
+    {
+      "id": "ANP-A3",
+      "name": "valid ANP mutual authentication and principal binding but no scoped delegation",
+      "interface": "ANP -> independent principal binding verifier -> NTI/ATP-compatible policy -> protected resource",
+      "condition": "valid ANP mutual authentication and principal binding but no scoped delegation",
+      "expected": "DENY",
+      "dispatch_count": 0
+    },
+    {
+      "id": "ANP-A4",
+      "name": "ANP response DID proof mismatched to request ID or expected peer",
+      "interface": "ANP -> independent principal binding verifier -> NTI/ATP-compatible policy -> protected resource",
+      "condition": "ANP response DID proof mismatched to request ID or expected peer",
+      "expected": "DENY",
+      "dispatch_count": 0
+    },
+    {
+      "id": "ANP-A5",
+      "name": "replayed ANP authentication or changed action digest",
+      "interface": "ANP -> independent principal binding verifier -> NTI/ATP-compatible policy -> protected resource",
+      "condition": "replayed ANP authentication or changed action digest",
+      "expected": "DENY",
+      "dispatch_count": 0
+    },
+    {
+      "id": "ANP-A6",
+      "name": "valid ANP authentication but required binding status authority unreachable",
+      "interface": "ANP -> independent principal binding verifier -> NTI/ATP-compatible policy -> protected resource",
+      "condition": "valid ANP authentication but required binding status authority unreachable",
+      "expected": "PAUSE",
+      "dispatch_count": 0,
+      "reason": "tryLater"
+    },
+    {
+      "id": "ANP-A7",
+      "name": "valid ANP authentication but delegation audience mismatches resource",
+      "interface": "ANP -> independent principal binding verifier -> NTI/ATP-compatible policy -> protected resource",
+      "condition": "valid ANP authentication but delegation audience mismatches resource",
+      "expected": "DENY",
+      "dispatch_count": 0
+    }
+  ],
+  "evidence_required": [
+    "credential and proof bytes hashes with test-only keys",
+    "issuer trust policy identifier",
+    "DID method and key resolution outcomes",
+    "credential and grant status source with verification timestamp",
+    "request ID, nonce, target resource, requested action",
+    "decision, reason, policy version, dispatch count",
+    "resource-confirmed outcome distinct from authorization decision",
+    "ANP expected-peer/request-response DID authentication proof verification and signed request digest/nonce/audience"
+  ],
+  "disclaimer": "These are proposed expectations, not executed integration tests or NTI certification."
+}
