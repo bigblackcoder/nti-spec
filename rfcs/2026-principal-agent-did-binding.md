@@ -112,3 +112,54 @@ Issuer governance, legal identity proofing and status availability introduce ope
 ## Process
 
 This is a candidate RFC only. Open a PR, solicit feedback from Gaowei, Abisheak and independent implementers, and follow NTI §10 public comment / 30-day review procedure before any normative adoption. Do not conflate acceptance of this proposal with acceptance of ATP or NTI production integrations.
+
+
+## ANP interoperability profile — explicit Layer 0 boundary (proposed)
+
+This RFC is a **jointly testable interface proposal**, not a claim that ANP maintainers have adopted this exact wire format. ANP (Agent Network Protocol) owns peer discovery, endpoint/transport interaction and DID-bound mutual authentication; the binding verifier consumes the authenticated DID evidence instead of inventing a competing ANP transport. ANP authentication is **not** evidence of legal identity or grant of action authority.
+
+### Responsibilities and proof handoff
+
+| Boundary | Producer | Consumer | What the proof establishes |
+| --- | --- | --- | --- |
+| Agent discovery and transport | ANP peer endpoints | Remote ANP peer | Communication endpoint and secure channel, subject to its authentication profile |
+| DID mutual authentication | ANP peers | Receiving agent/resource gateway | Proof of control for the **expected** requesting agent DID and responding peer DID, bound to interaction |
+| Legal-principal association | Accepted identity credential issuer | NTI / ATP or independent verifier | Issuer-attested agent-DID-to-principal relationship, according to local issuer policy |
+| Delegated authority | Principal or properly authorized delegator | NTI / ATP or independent verifier | Action-specific, time-bounded, revocable authority |
+| Resource enforcement | Protected resource / independent enforcement point | Acting agent | ALLOW / DENY / incomplete_check PAUSE and, separately, execution result evidence |
+
+### Minimum ANP-to-verifier context
+
+The gateway SHOULD pass the *authenticated* requester DID and verified peer-proof metadata into authorization evaluation, not a DID copied from an untrusted application payload. The proposed adapter contract includes:
+- `authenticated_agent_did`, `authenticated_peer_did`, `proof_profile_version`, `verification_method_id`;
+- `interaction_id`, `request_id`, `nonce`, `issued_at`, `expires_at`, `audience`;
+- `http_method`, `target_uri`, `content_digest` or canonical action digest;
+- a verifier result for the request and response proof, including expected-peer validation;
+- principal-binding credential, separate signed delegation, requested operation and authoritative status evidence.
+
+All these fields are a **proposed interface contract** requiring ANP review. Proof encoding, signature profile, DID resolution semantics, and mapping to any existing ANP proof fields must be agreed against the actual ANP specification. A receiving gateway MUST not blindly trust these fields if supplied by an untrusted agent; only verified, trusted gateway context may populate authenticated identities.
+
+### ANP ↔ NTI ↔ ATP end-to-end example
+
+1. Agent A discovers Agent B using ANP and negotiates protected transport.
+2. Both prove DID control using an ANP-supported mutual-authentication profile binding request, response, audience, peer DIDs, nonce, and freshness. The verifier checks that the resolved DID is the **expected peer**, not merely some valid DID.
+3. Agent B's enforcement gateway passes authenticated DID evidence to a method-neutral principal-binding checker.
+4. The checker validates issuer-attested legal-principal relationship, trusted-issuer rules, binding status, and separately delegated mandate/grant.
+5. NTI policy evaluation or an ATP-compatible verifier authorizes or refuses the exact action. The resource makes its own enforcement decision. An OAuth token, if used, is additional scoped evidence, not a substitute for principal binding or delegation.
+6. On ALLOW, the resource may perform the operation; on DENY or incomplete_check PAUSE, the resource MUST record **zero dispatches**. Resource-signed completion evidence must not be conflated with decision receipts.
+
+### ANP-specific conformance gates
+
+- ANP-A1: Valid mutual DID proof, valid binding, valid delegation, correct audience -> ALLOW; one controlled mock-resource dispatch.
+- ANP-A2: Valid ANP DID authentication but no principal binding -> DENY, zero dispatch.
+- ANP-A3: Valid ANP DID authentication and binding but no action delegation -> DENY, zero dispatch.
+- ANP-A4: ANP response proof bound to a **different request or peer DID** -> DENY, zero dispatch.
+- ANP-A5: A replayed ANP authentication proof or changed action digest -> DENY, zero dispatch.
+- ANP-A6: Valid ANP authentication, trusted issuer, but binding status authority unreachable -> `incomplete_check` / PAUSE, zero dispatch.
+- ANP-A7: Valid ANP peer proof but wrong resource audience on delegated grant -> DENY, zero dispatch.
+
+For each gate, the run record must capture ANP handshake/proof validation result, expected peer identity, digest/nonce/audience checks, verified credential result, delegation status, decision reason and independent resource dispatch counter. Test controls are **proposed**, not executed evidence.
+
+### Stakeholder review required
+
+ANP contributors (including Gaowei and Song) should confirm the existing wire-level proof profile and whether the above context can be derived without exposing raw personal identity claims. NTI contributors should review policy and fail-closed handling; ATP contributors should review method-neutral mandate verification. Do not merge this interoperability profile as a ratified ANP or NTI requirement without their respective processes.
