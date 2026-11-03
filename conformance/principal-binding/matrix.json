@@ -137,6 +137,63 @@
       "condition": "Trusted issuer but credential assurance level below required legal-identity claim policy",
       "expected": "DENY",
       "dispatch_count": 0
+    },
+    {
+      "id": "ANP-A1",
+      "name": "verified mutual ANP DID exchange plus accepted principal binding and delegation",
+      "interface": "ANP -> independent principal binding verifier -> NTI/ATP-compatible policy -> protected resource",
+      "condition": "verified mutual ANP DID exchange plus accepted principal binding and delegation",
+      "expected": "ALLOW",
+      "dispatch_count": 1
+    },
+    {
+      "id": "ANP-A2",
+      "name": "valid ANP DID authentication without accepted legal principal binding",
+      "interface": "ANP -> independent principal binding verifier -> NTI/ATP-compatible policy -> protected resource",
+      "condition": "valid ANP DID authentication without accepted legal principal binding",
+      "expected": "DENY",
+      "dispatch_count": 0
+    },
+    {
+      "id": "ANP-A3",
+      "name": "valid ANP mutual authentication and principal binding but no scoped delegation",
+      "interface": "ANP -> independent principal binding verifier -> NTI/ATP-compatible policy -> protected resource",
+      "condition": "valid ANP mutual authentication and principal binding but no scoped delegation",
+      "expected": "DENY",
+      "dispatch_count": 0
+    },
+    {
+      "id": "ANP-A4",
+      "name": "ANP response DID proof mismatched to request ID or expected peer",
+      "interface": "ANP -> independent principal binding verifier -> NTI/ATP-compatible policy -> protected resource",
+      "condition": "ANP response DID proof mismatched to request ID or expected peer",
+      "expected": "DENY",
+      "dispatch_count": 0
+    },
+    {
+      "id": "ANP-A5",
+      "name": "replayed ANP authentication or changed action digest",
+      "interface": "ANP -> independent principal binding verifier -> NTI/ATP-compatible policy -> protected resource",
+      "condition": "replayed ANP authentication or changed action digest",
+      "expected": "DENY",
+      "dispatch_count": 0
+    },
+    {
+      "id": "ANP-A6",
+      "name": "valid ANP authentication but required binding status authority unreachable",
+      "interface": "ANP -> independent principal binding verifier -> NTI/ATP-compatible policy -> protected resource",
+      "condition": "valid ANP authentication but required binding status authority unreachable",
+      "expected": "PAUSE",
+      "dispatch_count": 0,
+      "reason": "tryLater"
+    },
+    {
+      "id": "ANP-A7",
+      "name": "valid ANP authentication but delegation audience mismatches resource",
+      "interface": "ANP -> independent principal binding verifier -> NTI/ATP-compatible policy -> protected resource",
+      "condition": "valid ANP authentication but delegation audience mismatches resource",
+      "expected": "DENY",
+      "dispatch_count": 0
     }
   ],
   "evidence_required": [
@@ -146,7 +203,8 @@
     "credential and grant status source with verification timestamp",
     "request ID, nonce, target resource, requested action",
     "decision, reason, policy version, dispatch count",
-    "resource-confirmed outcome distinct from authorization decision"
+    "resource-confirmed outcome distinct from authorization decision",
+    "ANP expected-peer/request-response DID authentication proof verification and signed request digest/nonce/audience"
   ],
   "disclaimer": "These are proposed expectations, not executed integration tests or NTI certification."
 }
